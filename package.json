@@ -1,0 +1,13 @@
+{
+  "name": "rmi-toolkit",
+  "version": "1.0.0",
+  "description": "Revenue Management Intelligence — Bulk Data Generation Toolkit",
+  "type": "module",
+  "main": "bin/generate.js",
+  "scripts": {
+    "start": "node bin/generate.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0"
+  }
+}
