@@ -1,17 +1,17 @@
 # RMI Toolkit — Revenue Management Intelligence Bulk Data Generator
 
-An AI-guided CLI that generates realistic demo transaction data for a Salesforce Revenue Cloud org. It creates accounts, places priced orders via the `PlaceSalesTransaction` (PST) Apex API, and activates them — all through an interactive conversation with a Claude agent.
+A CLI toolkit that generates realistic demo transaction data for a Salesforce Revenue Cloud org. It creates accounts, places priced orders via the `PlaceSalesTransaction` (PST) Apex API, and activates them — all through an interactive prompt-based flow.
 
 ---
 
 ## Prerequisites
 
 - Node.js 18+
-- `sf` CLI authenticated to the target org (`iewc-mfg-rca`)
+- `sf` CLI authenticated to your target org
 
 Verify your org auth before running:
 ```bash
-sf org display --target-org iewc-mfg-rca
+sf org display --target-org <your-org-alias>
 ```
 
 ---
@@ -21,12 +21,12 @@ sf org display --target-org iewc-mfg-rca
 From the `rmi-toolkit/` directory:
 
 ```bash
-# 1. Install dependencies (already done if node_modules exists)
+# 1. Install dependencies
 npm install
 
-# 2. (Optional) Create a .env file if you need to override the target org
+# 2. Set your target org alias
 cp .env.example .env
-#    SF_TARGET_ORG=iewc-mfg-rca  (this is the default — only change if needed)
+#    Edit .env and set SF_TARGET_ORG to your org alias
 ```
 
 ---
@@ -49,9 +49,7 @@ You will be asked whether to create new accounts or use existing ones.
 - **Existing accounts:** all current accounts in the org will be used as targets.
 
 ### Phase 2 — Product Catalog
-Available product catalogs will be queried from the org and presented. Select one or both:
-- Wire and Cable Catalog (103 products)
-- Wire Management Catalog (98 products)
+Available product catalogs will be queried from the org and presented. Select one or more by number.
 
 ### Phase 3 — Order Generation
 Specify how many orders per account. The toolkit will then:
@@ -92,5 +90,5 @@ Standalone scripts for manual debugging are in `scripts/apex/data-gen/`:
 
 Run any of them with:
 ```bash
-sf apex run --target-org iewc-mfg-rca --file scripts/apex/data-gen/02_create_order_pst.apex
+sf apex run --target-org <your-org-alias> --file scripts/apex/data-gen/02_create_order_pst.apex
 ```
