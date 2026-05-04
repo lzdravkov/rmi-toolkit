@@ -36,7 +36,7 @@ export function runApex(apexCode) {
     if (result.status !== 0) {
       throw new Error(`Apex execution failed:\n${output}`);
     }
-    if (output.includes('COMPILE ERROR') || /System\.\w+Exception/.test(output)) {
+    if (output.includes('COMPILE ERROR') || output.includes('EXCEPTION_THROWN') && /Error \(execute/.test(output)) {
       throw new Error(`Apex error:\n${output}`);
     }
     return output;

@@ -2,12 +2,8 @@ import { runApex, extractDebugLines } from './org.js';
 import { pickRandom } from './catalog.js';
 
 const STANDARD_PRICEBOOK_ID = '01sHu0000094NbPIAU';
-
 const WARN_THRESHOLD = 200;
 
-/**
- * Generate a random date string (YYYY-MM-DD) between Jan 1 2025 and today.
- */
 function randomOrderDate() {
   const start = new Date('2025-01-01').getTime();
   const end = Date.now();
@@ -20,49 +16,61 @@ function randInt(min, max) {
 }
 
 /**
- * Build Apex code that calls PlaceSalesTransaction for a single order.
- *
- * lineItems: [ { productId, pricebookEntryId, unitPrice } ]
- * discounts: [ 0–40 (percent) ] — one per line item
+ * Poll until the Quote's tax calculation is complete (not TaxCalculationInProcess).
+ * PST triggers async tax calculation; conversion fails if it hasn't finished.
  */
-function buildPSTApex(accountId, effectiveDate, lineItems, discounts) {
+async function waitForQuoteReady(quoteId, maxWaitMs = 30000) {
+  const { query } = await import('./org.js');
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const records = query(`SELECT Id, CalculationStatus FROM Quote WHERE Id = '${quoteId}'`);
+    const status = records[0]?.CalculationStatus ?? '';
+    if (status !== 'TaxCalculationInProcess') return;
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+/**
+ * Step 1 — PST: Create and price a Quote with QuoteLineItems.
+ * AccountId is not writable on Quote via PST — we link the account
+ * via a stub Opportunity in Step 2.
+ */
+function buildPSTApex(quoteDate, lineItems, discounts) {
+  const quoteName = `RMI-${quoteDate}-${randInt(1000, 9999)}`;
   const lines = [];
   lines.push(`
 RevSalesTrxn.PricingPreferenceEnum pricingPref = RevSalesTrxn.PricingPreferenceEnum.SYSTEM;
 RevSalesTrxn.ConfigurationExecutionEnum configExec = RevSalesTrxn.ConfigurationExecutionEnum.SYSTEM;
 
-RevSalesTrxn.RecordResource orderRecord = new RevSalesTrxn.RecordResource(Order.getSobjectType(), 'POST');
-Map<String,Object> orderFields = new Map<String,Object>();
-orderFields.put('AccountId', '${accountId}');
-orderFields.put('Pricebook2Id', '${STANDARD_PRICEBOOK_ID}');
-orderFields.put('EffectiveDate', '${effectiveDate}');
-orderFields.put('Status', 'Draft');
-orderRecord.fieldValues = orderFields;
+RevSalesTrxn.RecordResource quoteRecord = new RevSalesTrxn.RecordResource(Quote.getSobjectType(), 'POST');
+Map<String,Object> quoteFields = new Map<String,Object>();
+quoteFields.put('Name', '${quoteName}');
+quoteFields.put('Pricebook2Id', '${STANDARD_PRICEBOOK_ID}');
+quoteFields.put('ExpirationDate', '${quoteDate}');
+quoteRecord.fieldValues = quoteFields;
 
 List<RevSalesTrxn.RecordWithReferenceRequest> records = new List<RevSalesTrxn.RecordWithReferenceRequest>();
-records.add(new RevSalesTrxn.RecordWithReferenceRequest('refOrder', orderRecord));
+records.add(new RevSalesTrxn.RecordWithReferenceRequest('refQuote', quoteRecord));
 `);
 
   lineItems.forEach((item, idx) => {
-    const ref = `refItem${idx + 1}`;
     const discountPct = discounts[idx] ?? 0;
     lines.push(`
-RevSalesTrxn.RecordResource item${idx + 1} = new RevSalesTrxn.RecordResource(OrderItem.getSobjectType(), 'POST');
+RevSalesTrxn.RecordResource item${idx + 1} = new RevSalesTrxn.RecordResource(QuoteLineItem.getSobjectType(), 'POST');
 Map<String,Object> itemFields${idx + 1} = new Map<String,Object>();
 itemFields${idx + 1}.put('Product2Id', '${item.productId}');
 itemFields${idx + 1}.put('PricebookEntryId', '${item.pricebookEntryId}');
 itemFields${idx + 1}.put('Quantity', ${randInt(100, 5000)}.0);
 itemFields${idx + 1}.put('UnitPrice', ${item.unitPrice});
-itemFields${idx + 1}.put('ListPrice', ${item.unitPrice});
 itemFields${idx + 1}.put('Discount', ${discountPct});
-itemFields${idx + 1}.put('OrderId', '@{refOrder.id}');
+itemFields${idx + 1}.put('QuoteId', '@{refQuote.id}');
 item${idx + 1}.fieldValues = itemFields${idx + 1};
-records.add(new RevSalesTrxn.RecordWithReferenceRequest('${ref}', item${idx + 1}));
+records.add(new RevSalesTrxn.RecordWithReferenceRequest('refItem${idx + 1}', item${idx + 1}));
 `);
   });
 
   lines.push(`
-RevSalesTrxn.GraphRequest graph = new RevSalesTrxn.GraphRequest('rmi_order_${Date.now()}', records);
+RevSalesTrxn.GraphRequest graph = new RevSalesTrxn.GraphRequest('rmi_quote_${Date.now()}', records);
 
 RevSalesTrxn.PlaceSalesTransactionResponse resp =
   RevSalesTrxn.PlaceSalesTransactionExecutor.execute(
@@ -83,12 +91,107 @@ if (resp != null && resp.isSuccess) {
 }
 
 /**
- * Build Apex to activate a single order by ID.
+ * Step 2 — Link account to Quote via a stub Opportunity.
+ * Also ensures a Bill-To Contact exists on the Account (required for Order activation).
+ * Quote.AccountId is not directly writable; setting OpportunityId
+ * on the Quote propagates the AccountId automatically.
+ * Returns the Contact Id for use in Step 4.
  */
-function buildActivationApex(orderId) {
+function buildLinkAccountApex(quoteId, accountId, quoteDate) {
   return `
 try {
-  Order o = [SELECT Id, Status FROM Order WHERE Id = '${orderId}' LIMIT 1];
+  // Ensure a Contact exists for this Account (required for Order activation)
+  List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = '${accountId}' LIMIT 1];
+  Contact billToContact;
+  if (contacts.isEmpty()) {
+    billToContact = new Contact(
+      FirstName = 'RMI',
+      LastName = 'Contact',
+      AccountId = '${accountId}'
+    );
+    insert billToContact;
+  } else {
+    billToContact = contacts[0];
+  }
+
+  Opportunity opp = new Opportunity(
+    Name = 'RMI-${quoteDate}-${randInt(1000, 9999)}',
+    AccountId = '${accountId}',
+    StageName = 'Prospecting',
+    CloseDate = Date.valueOf('${quoteDate}')
+  );
+  insert opp;
+  Quote q = new Quote(Id = '${quoteId}', OpportunityId = opp.Id);
+  update q;
+  System.debug('LINK_SUCCESS|${quoteId}|' + opp.Id + '|' + billToContact.Id);
+} catch (Exception e) {
+  System.debug('LINK_FAILED|${quoteId}|' + e.getMessage());
+}
+`;
+}
+
+/**
+ * Step 3 — Convert Quote to Order via the createOrderFromQuote
+ * standard invocable action (REST call within Apex).
+ */
+function buildConvertApex(quoteId) {
+  return `
+try {
+  String endpoint = URL.getOrgDomainUrl().toExternalForm()
+    + '/services/data/v66.0/actions/standard/createOrderFromQuote';
+  HttpRequest req = new HttpRequest();
+  req.setEndpoint(endpoint);
+  req.setMethod('POST');
+  req.setHeader('Content-Type', 'application/json');
+  req.setHeader('Authorization', 'Bearer ' + UserInfo.getSessionId());
+  req.setBody('{"inputs":[{"quoteRecordId":"${quoteId}"}]}');
+  HttpResponse res = new Http().send(req);
+  if (res.getStatusCode() == 200) {
+    List<Object> results = (List<Object>) JSON.deserializeUntyped(res.getBody());
+    Map<String,Object> result = (Map<String,Object>) results[0];
+    Boolean success = (Boolean) result.get('isSuccess');
+    if (success) {
+      Map<String,Object> outputs = (Map<String,Object>) result.get('outputValues');
+      System.debug('CONVERT_SUCCESS|' + (String) outputs.get('orderId'));
+    } else {
+      System.debug('CONVERT_FAILED|${quoteId}|' + String.valueOf(result.get('errors')));
+    }
+  } else {
+    System.debug('CONVERT_FAILED|${quoteId}|HTTP ' + res.getStatusCode() + ': ' + res.getBody());
+  }
+} catch (Exception e) {
+  System.debug('CONVERT_FAILED|${quoteId}|' + e.getMessage());
+}
+`;
+}
+
+/**
+ * Step 4 — Set BillToContactId, copy address from Account, then activate.
+ * Orders converted from Quotes require a bill-to contact and billing address.
+ */
+function buildActivationApex(orderId, contactId) {
+  return `
+try {
+  Order o = [SELECT Id, Status, AccountId,
+               BillingStreet, BillingCity, BillingState, BillingCountry, BillingPostalCode,
+               ShippingStreet, ShippingCity, ShippingState, ShippingCountry, ShippingPostalCode
+             FROM Order WHERE Id = '${orderId}' LIMIT 1];
+  if (o.AccountId != null && (o.BillingState == null || o.BillingState == '')) {
+    Account acc = [SELECT BillingStreet, BillingCity, BillingState, BillingCountry, BillingPostalCode,
+                          ShippingStreet, ShippingCity, ShippingState, ShippingCountry, ShippingPostalCode
+                   FROM Account WHERE Id = :o.AccountId LIMIT 1];
+    o.BillingStreet      = acc.BillingStreet;
+    o.BillingCity        = acc.BillingCity;
+    o.BillingState       = acc.BillingState;
+    o.BillingCountry     = acc.BillingCountry;
+    o.BillingPostalCode  = acc.BillingPostalCode;
+    o.ShippingStreet     = acc.ShippingStreet;
+    o.ShippingCity       = acc.ShippingCity;
+    o.ShippingState      = acc.ShippingState;
+    o.ShippingCountry    = acc.ShippingCountry;
+    o.ShippingPostalCode = acc.ShippingPostalCode;
+  }
+  o.BillToContactId = '${contactId}';
   o.Status = 'Activated';
   update o;
   System.debug('ACTIVATED|${orderId}');
@@ -100,19 +203,13 @@ try {
 
 /**
  * Main order generation loop.
- *
- * accounts: [ { id, name } ]
- * productPool: [ { productId, pricebookEntryId, unitPrice } ]
- * ordersPerAccount: number
- * onProgress: (msg) => void  — called with status updates
- *
- * Returns { created: [ orderId ], failed: [ { accountId, error } ] }
+ * Flow per transaction: PST (Quote) → link Account → createOrderFromQuote → Activate Order
  */
 export async function generateOrders(accounts, productPool, ordersPerAccount, onProgress) {
   const totalOrders = accounts.length * ordersPerAccount;
 
   if (totalOrders > WARN_THRESHOLD) {
-    onProgress(`⚠️  Warning: ${totalOrders} total orders (${accounts.length} accounts × ${ordersPerAccount} orders). This will take a while. Proceeding...`);
+    onProgress(`⚠️  Warning: ${totalOrders} total orders. This will take a while. Proceeding...`);
   }
 
   const created = [];
@@ -125,53 +222,78 @@ export async function generateOrders(accounts, productPool, ordersPerAccount, on
       const lineCount = randInt(3, 10);
       const lineItems = pickRandom(productPool, lineCount);
       const discounts = lineItems.map(() => randInt(0, 40));
-      const effectiveDate = randomOrderDate();
+      const quoteDate = randomOrderDate();
 
-      onProgress(`[${orderNum}/${totalOrders}] Creating order for "${account.name}" — ${lineItems.length} line items, date ${effectiveDate}`);
+      onProgress(`[${orderNum}/${totalOrders}] "${account.name}" — ${lineItems.length} line items, date ${quoteDate}`);
 
       try {
-        const apex = buildPSTApex(account.id, effectiveDate, lineItems, discounts);
-        const output = runApex(apex);
-        const debugLines = extractDebugLines(output);
+        // Step 1 — Create priced Quote via PST
+        const pstOutput = runApex(buildPSTApex(quoteDate, lineItems, discounts));
+        const pstLines = extractDebugLines(pstOutput);
 
-        let orderId = null;
-        let pstFailed = false;
+        let quoteId = null;
         let pstError = '';
-
-        for (const line of debugLines) {
-          if (line.startsWith('PST_SUCCESS|')) {
-            orderId = line.split('|')[1];
-          } else if (line.startsWith('PST_FAILURE|')) {
-            pstFailed = true;
-            pstError = line.split('|').slice(1).join('|');
-          }
+        for (const line of pstLines) {
+          if (line.startsWith('PST_SUCCESS|')) quoteId = line.split('|')[1];
+          else if (line.startsWith('PST_FAILURE|')) pstError = line.split('|').slice(1).join('|');
         }
-
-        if (pstFailed || !orderId) {
-          failed.push({ accountName: account.name, error: pstError || 'PST returned no order ID' });
+        if (!quoteId) {
+          failed.push({ accountName: account.name, error: pstError || 'PST returned no Quote ID' });
           onProgress(`  ✗ PST failed: ${pstError}`);
           continue;
         }
+        onProgress(`  → Quote ${quoteId} created`);
 
-        // Activate the order
-        const activateApex = buildActivationApex(orderId);
-        const activateOutput = runApex(activateApex);
+        // Wait for PST tax calculation to complete before conversion
+        await waitForQuoteReady(quoteId);
+
+        // Step 2 — Link Account via stub Opportunity, ensure Bill-To Contact exists
+        const linkOutput = runApex(buildLinkAccountApex(quoteId, account.id, quoteDate));
+        const linkLines = extractDebugLines(linkOutput);
+        let linkError = '';
+        let contactId = null;
+        for (const line of linkLines) {
+          if (line.startsWith('LINK_SUCCESS|')) contactId = line.split('|')[3];
+          else if (line.startsWith('LINK_FAILED|')) linkError = line.split('|').slice(2).join('|');
+        }
+        if (!contactId) {
+          failed.push({ accountName: account.name, error: linkError || 'Account link failed' });
+          onProgress(`  ✗ Account link failed: ${linkError}`);
+          continue;
+        }
+
+        // Step 3 — Convert Quote to Order
+        const convertOutput = runApex(buildConvertApex(quoteId));
+        const convertLines = extractDebugLines(convertOutput);
+        let orderId = null;
+        let convertError = '';
+        for (const line of convertLines) {
+          if (line.startsWith('CONVERT_SUCCESS|')) orderId = line.split('|')[1];
+          else if (line.startsWith('CONVERT_FAILED|')) convertError = line.split('|').slice(2).join('|');
+        }
+        if (!orderId) {
+          failed.push({ accountName: account.name, error: convertError || 'Conversion returned no Order ID' });
+          onProgress(`  ✗ Conversion failed: ${convertError}`);
+          continue;
+        }
+        onProgress(`  → Order ${orderId} created from Quote`);
+
+        // Step 4 — Activate the Order
+        const activateOutput = runApex(buildActivationApex(orderId, contactId));
         const activateLines = extractDebugLines(activateOutput);
-
         let activateFailed = false;
         for (const line of activateLines) {
           if (line.startsWith('ACTIVATE_FAILED|')) {
             activateFailed = true;
-            const errMsg = line.split('|').slice(2).join('|');
-            onProgress(`  ✗ Activation failed for ${orderId}: ${errMsg}`);
-            failed.push({ accountName: account.name, error: `Activation: ${errMsg}` });
+            onProgress(`  ✗ Activation failed: ${line.split('|').slice(2).join('|')}`);
+            failed.push({ accountName: account.name, error: `Activation: ${line.split('|').slice(2).join('|')}` });
           }
         }
-
         if (!activateFailed) {
           created.push(orderId);
-          onProgress(`  ✓ Order ${orderId} created and activated`);
+          onProgress(`  ✓ Order ${orderId} activated (from Quote ${quoteId})`);
         }
+
       } catch (err) {
         failed.push({ accountName: account.name, error: err.message });
         onProgress(`  ✗ Exception: ${err.message}`);
