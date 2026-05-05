@@ -172,13 +172,14 @@ try {
  * Step 4 — Set BillToContactId, copy address from Account, then activate.
  * Orders converted from Quotes require a bill-to contact and billing address.
  */
-function buildActivationApex(orderId, contactId) {
+function buildActivationApex(orderId, contactId, quoteDate) {
   return `
 try {
   Order o = [SELECT Id, Status, AccountId,
                BillingStreet, BillingCity, BillingState, BillingCountry, BillingPostalCode,
                ShippingStreet, ShippingCity, ShippingState, ShippingCountry, ShippingPostalCode
              FROM Order WHERE Id = '${orderId}' LIMIT 1];
+  o.EffectiveDate = Date.valueOf('${quoteDate}');
   if (o.AccountId != null && (o.BillingState == null || o.BillingState == ''
       || o.ShippingState == null || o.ShippingState == '')) {
     Account acc = [SELECT BillingStreet, BillingCity, BillingState, BillingCountry, BillingPostalCode,
@@ -288,7 +289,7 @@ export async function generateOrders(accounts, productPool, ordersPerAccount, on
         onProgress(`  → Order ${orderId} created from Quote`);
 
         // Step 4 — Activate the Order
-        const activateOutput = runApex(buildActivationApex(orderId, contactId));
+        const activateOutput = runApex(buildActivationApex(orderId, contactId, quoteDate));
         const activateLines = extractDebugLines(activateOutput);
         let activateFailed = false;
         for (const line of activateLines) {
