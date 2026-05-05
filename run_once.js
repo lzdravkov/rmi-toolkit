@@ -3,12 +3,13 @@
 // Parameters are set directly below.
 import 'dotenv/config';
 import { fetchCatalogs, fetchProductPool, mergeProductPools } from './src/catalog.js';
-import { checkCustomerTierFieldExists, buildAccountData, createAccounts } from './src/accounts.js';
+import { checkCustomerTierFieldExists, buildAccountData, createAccounts, fetchExistingAccounts } from './src/accounts.js';
 import { generateOrders } from './src/orders.js';
+import { query } from './src/org.js';
 
 // ── Parameters ────────────────────────────────────────────────────────────────
-const CREATE_NEW_ACCOUNTS  = true;
-const ACCOUNT_COUNT        = 10;
+const CREATE_NEW_ACCOUNTS  = false; // use existing accounts created today
+const ACCOUNT_COUNT        = 5;
 const CATALOG_NAMES        = ['Wire and Cable']; // match by name fragment
 const ORDERS_MIN           = 5;
 const ORDERS_MAX           = 15;
@@ -36,8 +37,10 @@ if (CREATE_NEW_ACCOUNTS) {
   accounts = createAccounts(accountData, hasTierField);
   print(`✓ ${accounts.length} account(s) created: ${accounts.map(a => a.name).join(', ')}`);
 } else {
-  print('Using existing accounts — not implemented in this script.');
-  process.exit(1);
+  print('Fetching accounts created today...');
+  const todayAccounts = query(`SELECT Id, Name FROM Account WHERE CreatedDate = TODAY ORDER BY Name`);
+  accounts = todayAccounts.map(a => ({ id: a.Id, name: a.Name }));
+  print(`✓ ${accounts.length} account(s) found: ${accounts.map(a => a.name).join(', ')}`);
 }
 
 // Phase 2 — Catalog

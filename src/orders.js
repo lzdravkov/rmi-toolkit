@@ -72,18 +72,21 @@ records.add(new RevSalesTrxn.RecordWithReferenceRequest('refItem${idx + 1}', ite
   lines.push(`
 RevSalesTrxn.GraphRequest graph = new RevSalesTrxn.GraphRequest('rmi_quote_${Date.now()}', records);
 
-RevSalesTrxn.PlaceSalesTransactionResponse resp =
-  RevSalesTrxn.PlaceSalesTransactionExecutor.execute(
-    graph, pricingPref, configExec,
-    new RevSalesTrxn.ConfigurationOptionsInput(),
-    null
-  );
-
-if (resp != null && resp.isSuccess) {
-  System.debug('PST_SUCCESS|' + resp.salesTransactionId);
-} else {
-  String errMsg = (resp != null && resp.errorResponse != null) ? String.valueOf(resp.errorResponse) : 'null response';
-  System.debug('PST_FAILURE|' + errMsg);
+try {
+  RevSalesTrxn.PlaceSalesTransactionResponse resp =
+    RevSalesTrxn.PlaceSalesTransactionExecutor.execute(
+      graph, pricingPref, configExec,
+      new RevSalesTrxn.ConfigurationOptionsInput(),
+      null
+    );
+  if (resp != null && resp.isSuccess) {
+    System.debug('PST_SUCCESS|' + resp.salesTransactionId);
+  } else {
+    String errMsg = (resp != null && resp.errorResponse != null) ? String.valueOf(resp.errorResponse) : 'null response';
+    System.debug('PST_FAILURE|' + errMsg);
+  }
+} catch (Exception e) {
+  System.debug('PST_FAILURE|' + e.getTypeName() + ': ' + e.getMessage());
 }
 `);
 
@@ -176,20 +179,26 @@ try {
                BillingStreet, BillingCity, BillingState, BillingCountry, BillingPostalCode,
                ShippingStreet, ShippingCity, ShippingState, ShippingCountry, ShippingPostalCode
              FROM Order WHERE Id = '${orderId}' LIMIT 1];
-  if (o.AccountId != null && (o.BillingState == null || o.BillingState == '')) {
+  if (o.AccountId != null && (o.BillingState == null || o.BillingState == ''
+      || o.ShippingState == null || o.ShippingState == '')) {
     Account acc = [SELECT BillingStreet, BillingCity, BillingState, BillingCountry, BillingPostalCode,
                           ShippingStreet, ShippingCity, ShippingState, ShippingCountry, ShippingPostalCode
                    FROM Account WHERE Id = :o.AccountId LIMIT 1];
-    o.BillingStreet      = acc.BillingStreet;
-    o.BillingCity        = acc.BillingCity;
-    o.BillingState       = acc.BillingState;
-    o.BillingCountry     = acc.BillingCountry;
-    o.BillingPostalCode  = acc.BillingPostalCode;
-    o.ShippingStreet     = acc.ShippingStreet;
-    o.ShippingCity       = acc.ShippingCity;
-    o.ShippingState      = acc.ShippingState;
-    o.ShippingCountry    = acc.ShippingCountry;
-    o.ShippingPostalCode = acc.ShippingPostalCode;
+    if (o.BillingState == null || o.BillingState == '') {
+      o.BillingStreet     = acc.BillingStreet;
+      o.BillingCity       = acc.BillingCity;
+      o.BillingState      = acc.BillingState;
+      o.BillingCountry    = acc.BillingCountry;
+      o.BillingPostalCode = acc.BillingPostalCode;
+    }
+    if (o.ShippingState == null || o.ShippingState == '') {
+      // Fall back to billing address values if account shipping is also blank
+      o.ShippingStreet     = acc.ShippingStreet != null ? acc.ShippingStreet : acc.BillingStreet;
+      o.ShippingCity       = acc.ShippingCity != null ? acc.ShippingCity : acc.BillingCity;
+      o.ShippingState      = acc.ShippingState != null ? acc.ShippingState : acc.BillingState;
+      o.ShippingCountry    = acc.ShippingCountry != null ? acc.ShippingCountry : acc.BillingCountry;
+      o.ShippingPostalCode = acc.ShippingPostalCode != null ? acc.ShippingPostalCode : acc.BillingPostalCode;
+    }
   }
   o.BillToContactId = '${contactId}';
   o.Status = 'Activated';
